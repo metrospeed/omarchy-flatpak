@@ -1,0 +1,85 @@
+#!/bin/bash
+# Browse and install apps from the existing system Flathub remote.
+set -euo pipefail
+
+if [[ ${1:-} == --help ]]; then
+  echo 'Usage: omarchy-pkg-flatpak-install'
+  echo 'Search Flathub; Tab selects multiple apps, Enter installs, Esc cancels.'
+  exit 0
+fi
+
+pause_on_exit() {
+  local status=$?
+  if (( status != 0 )); then
+    printf '\nFlatpak installer stopped (exit %s).\n' "$status" >&2
+  fi
+  if [[ -t 0 ]]; then
+    read -r -p 'Press Enter to close…' || true
+  fi
+}
+trap pause_on_exit EXIT
+
+for command in flatpak fzf; do
+  command -v "$command" >/dev/null || { echo "Required command missing: $command" >&2; exit 1; }
+done
+remotes=$(flatpak remotes --system --columns=name)
+if ! grep -Fxq flathub <<< "$remotes"; then
+  echo 'The system Flathub remote is not configured.' >&2
+  exit 1
+fi
+
+printf 'Loading Flathub applications…\n'
+catalog=$(flatpak remote-ls --system --app --columns=ref,name,description flathub)
+[[ -n $catalog ]] || { echo 'Flathub returned no applications.' >&2; exit 1; }
+
+status=0
+selected=$(fzf --multi --delimiter=$'\t' --with-nth=2,1,3 \
+  --prompt='Flatpak > ' \
+  --header='Flathub · Tab: select multiple · Enter: install · Esc: cancel' \
+  --preview 'flatpak remote-info --system --cached flathub {1}' \
+  --preview-label='alt-p: toggle description, alt-j/k: scroll, tab: multi-select' \
+  --preview-label-pos=bottom --preview-window='down:65%:wrap' \
+  --bind='alt-p:toggle-preview,alt-d:preview-half-page-down,alt-u:preview-half-page-up,alt-k:preview-up,alt-j:preview-down' \
+  --color='pointer:green,marker:green' <<< "$catalog") || status=$?
+if (( status == 1 || status == 130 )); then
+  trap - EXIT
+  exit 0
+elif (( status != 0 )); then
+  exit "$status"
+fi
+[[ -n $selected ]] || exit 0
+
+refs=()
+while IFS=$'\t' read -r ref rest; do
+  [[ $ref == app/*/*/* ]] || { echo "Unexpected application reference: $ref" >&2; exit 1; }
+  refs+=("$ref")
+done <<< "$selected"
+
+# Keep Flatpak's normal transaction confirmation and authentication.
+flatpak install --system flathub "${refs[@]}"
+
+# The running desktop may predate Flatpak and lack its XDG_DATA_DIRS.
+# Links retain upstream updates and never replace existing user overrides.
+data_dir=${XDG_DATA_HOME:-$HOME/.local/share}
+exports=/var/lib/flatpak/exports/share
+mkdir -p "$data_dir/applications"
+shopt -s nullglob
+for ref in "${refs[@]}"; do
+  id=${ref#app/}
+  id=${id%%/*}
+  for source in "$exports/applications/$id.desktop" "$exports/applications/$id".*.desktop; do
+    [[ -f $source ]] || continue
+    target="$data_dir/applications/${source##*/}"
+    [[ -e $target || -L $target ]] || ln -s "$source" "$target"
+  done
+  for source in "$exports"/icons/hicolor/*/apps/"$id".*; do
+    [[ -f $source ]] || continue
+    target="$data_dir/${source#"$exports/"}"
+    mkdir -p "${target%/*}"
+    [[ -e $target || -L $target ]] || ln -s "$source" "$target"
+  done
+done
+if command -v update-desktop-database >/dev/null; then
+  update-desktop-database "$data_dir/applications"
+fi
+printf '\nInstallation complete. Reopen the application list to find your apps.\n'

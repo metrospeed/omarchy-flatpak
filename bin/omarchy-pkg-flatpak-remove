@@ -1,0 +1,94 @@
+#!/bin/bash
+# Select installed Flatpak apps to uninstall, preserving their saved data.
+set -euo pipefail
+
+if [[ ${1:-} == --help ]]; then
+  echo 'Usage: omarchy-pkg-flatpak-remove'
+  echo 'Search installed apps; Tab selects multiple, Enter removes, Esc cancels.'
+  echo 'Includes system and user apps. Saved app data is preserved.'
+  exit 0
+fi
+
+pause_on_exit() {
+  local status=$?
+  if (( status != 0 )); then
+    printf '\nFlatpak removal stopped (exit %s).\n' "$status" >&2
+  fi
+  if [[ -t 0 ]]; then read -r -p 'Press Enter to close…' || true; fi
+}
+trap pause_on_exit EXIT
+for command in flatpak fzf; do
+  command -v "$command" >/dev/null || { echo "Required command missing: $command" >&2; exit 1; }
+done
+
+catalog=''
+for scope in system user; do
+  apps=$(flatpak list "--$scope" --app --columns=ref,name,version)
+  if [[ -n $apps ]]; then
+    while IFS= read -r row; do
+      # flatpak list emits ID/arch/branch, unlike remote-ls (app/ID/arch/branch).
+      [[ $row == app/* ]] || row="app/$row"
+      catalog+="$scope"$'\t'"$row"$'\n'
+    done <<< "$apps"
+  fi
+done
+[[ -n $catalog ]] || { echo 'No Flatpak apps are installed.'; exit 0; }
+status=0
+selected=$(fzf --multi --delimiter=$'\t' --with-nth=3,1,2,4 \
+  --prompt='Remove Flatpak > ' \
+  --header='Tab: select multiple · Enter: remove · Esc: cancel · Saved app data is kept' \
+  --preview 'flatpak info --{1} {2}' \
+  --preview-label='alt-p: toggle description, alt-j/k: scroll, tab: multi-select' \
+  --preview-label-pos=bottom --preview-window='down:65%:wrap' \
+  --bind='alt-p:toggle-preview,alt-d:preview-half-page-down,alt-u:preview-half-page-up,alt-k:preview-up,alt-j:preview-down' \
+  --color='pointer:green,marker:green' <<< "${catalog%$'\n'}") || status=$?
+if (( status == 1 || status == 130 )); then
+  trap - EXIT
+  exit 0
+elif (( status != 0 )); then
+  exit "$status"
+fi
+[[ -n $selected ]] || exit 0
+
+system_refs=()
+user_refs=()
+while IFS=$'\t' read -r scope ref rest; do
+  [[ $ref == app/*/*/* ]] || { echo "Unexpected app reference: $ref" >&2; exit 1; }
+  case $scope in
+    system) system_refs+=("$ref");;
+    user) user_refs+=("$ref");;
+    *) echo "Unexpected installation: $scope" >&2; exit 1;;
+  esac
+done <<< "$selected"
+
+# Only remove broken links into Flatpak exports, never custom desktop files
+# or links still used by another installed branch of the same app.
+cleanup_links() {
+  local ref id target destination
+  local data_dir=${XDG_DATA_HOME:-$HOME/.local/share}
+  shopt -s nullglob
+  for ref in "$@"; do
+    id=${ref#app/}; id=${id%%/*}
+    for target in "$data_dir/applications/$id.desktop" \
+      "$data_dir/applications/$id".*.desktop \
+      "$data_dir"/icons/hicolor/*/apps/"$id".*; do
+      [[ -L $target && ! -e $target ]] || continue
+      destination=$(readlink "$target")
+      case $destination in
+        /var/lib/flatpak/exports/share/*|"$data_dir/flatpak/exports/share/"*) rm -- "$target";;
+      esac
+    done
+  done
+  if [[ -d $data_dir/applications ]] && command -v update-desktop-database >/dev/null; then
+    update-desktop-database "$data_dir/applications"
+  fi
+}
+
+# Flatpak presents its normal confirmation; do not delete saved app data.
+for scope in system user; do
+  if [[ $scope == system ]]; then refs=("${system_refs[@]}"); else refs=("${user_refs[@]}"); fi
+  (( ${#refs[@]} )) || continue
+  flatpak uninstall "--$scope" "${refs[@]}"
+  cleanup_links "${refs[@]}"
+done
+printf '\nRemoval complete. Reopen the application list to refresh it.\n'
