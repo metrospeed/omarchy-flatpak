@@ -9,11 +9,13 @@ omarchy_root=${OMARCHY_PATH:-/usr/share/omarchy}
   exit 1
 }
 command -v xdg-terminal-exec >/dev/null || { echo 'xdg-terminal-exec is required.' >&2; exit 1; }
+# Keep confirmation input on the terminal: stdin may contain this script
+# when invoked with curl | bash. Never let package tools consume that pipe.
 missing=()
 for dependency in flatpak fzf python curl; do
   command -v "$dependency" >/dev/null || missing+=("$dependency")
 done
-if (( ${#missing[@]} )); then sudo pacman -S --needed "${missing[@]}"; fi
+if (( ${#missing[@]} )); then sudo pacman -S --needed "${missing[@]}" </dev/tty; fi
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
 source_dir=''
@@ -36,7 +38,7 @@ bindir=$HOME/.local/bin
 menu=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/extensions/omarchy-menu.jsonc
 python "$source_dir/scripts/menu.py" "$menu" "$scratch/menu.jsonc" "$bindir"
 # System scope matches Omarchy's package installer and existing Flatpak apps.
-sudo flatpak remote-add --system --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+sudo flatpak remote-add --system --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo </dev/tty
 backup=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-flatpak/backups/$(date +%Y%m%d-%H%M%S)-$$
 mkdir -p "$backup" "$bindir" "$(dirname "$menu")"
 [[ ! -e $menu ]] || cp -p "$menu" "$backup/omarchy-menu.jsonc"
